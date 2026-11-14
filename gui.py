@@ -23,6 +23,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -169,6 +170,27 @@ QPlainTextEdit#LogView {
     padding: 6px;
     selection-background-color: #4f6df5;
 }
+QFrame#UsagePanel {
+    background-color: #ffffff;
+    border-bottom: 1px solid #e3e7f0;
+}
+QLabel#UsageLabel {
+    color: #4a5568;
+    font-size: 11px;
+}
+QProgressBar#UsageBar {
+    background-color: #eef1f8;
+    border: 1px solid #dfe3ee;
+    border-radius: 7px;
+    height: 14px;
+    text-align: center;
+    font-size: 10px;
+    color: #1f2430;
+}
+QProgressBar#UsageBar::chunk {
+    background-color: #4f6df5;
+    border-radius: 7px;
+}
 """
 
 
@@ -180,6 +202,7 @@ class ChatWorker(QThread):
 
     reply = pyqtSignal(str)
     tools = pyqtSignal(list)
+    stats = pyqtSignal(dict)
     failure = pyqtSignal(str)
 
     def __init__(self, message: str, parent=None):
@@ -193,8 +216,6 @@ class ChatWorker(QThread):
                 json={"message": self._message},
                 timeout=REQUEST_TIMEOUT,
             )
-            response.raise_for_status()
-            payload = response.json()
         except requests.exceptions.ConnectionError:
             self.failure.emit("Сервер агента недоступен. Запусти program.py")
             return
@@ -205,11 +226,24 @@ class ChatWorker(QThread):
             self.failure.emit(f"Ошибка: {exc}")
             return
 
+        try:
+            payload = response.json()
+        except ValueError:
+            self.failure.emit(
+                f"Некорректный ответ сервера (HTTP {response.status_code})."
+            )
+            return
+
         if "error" in payload:
             self.failure.emit(str(payload["error"]))
-        else:
-            self.tools.emit(payload.get("tools", []))
-            self.reply.emit(str(payload.get("response", "")))
+            return
+        if not response.ok:
+            self.failure.emit(f"HTTP {response.status_code}")
+            return
+
+        self.stats.emit(payload.get("usage", {}))
+        self.tools.emit(payload.get("tools", []))
+        self.reply.emit(str(payload.get("response", "")))
 
 
 # ==========================================
@@ -354,6 +388,37 @@ class ChatWindow(QWidget):
         header_layout.addWidget(title)
         header_layout.addWidget(subtitle)
         root.addWidget(header)
+
+        # Панель расхода контекста и токенов
+        self.usage_panel = QFrame()
+        self.usage_panel.setObjectName("UsagePanel")
+        usage_layout = QHBoxLayout(self.usage_panel)
+        usage_layout.setContentsMargins(20, 6, 20, 6)
+        usage_layout.setSpacing(16)
+
+        self.usage_req = QLabel("Запрос: —")
+        self.usage_req.setObjectName("UsageLabel")
+        self.usage_resp = QLabel("Ответ: —")
+        self.usage_resp.setObjectName("UsageLabel")
+        self.usage_ctx = QLabel("Контекст: — / —")
+        self.usage_ctx.setObjectName("UsageLabel")
+        self.usage_iter = QLabel("Итераций: —")
+        self.usage_iter.setObjectName("UsageLabel")
+
+        self.usage_bar = QProgressBar()
+        self.usage_bar.setObjectName("UsageBar")
+        self.usage_bar.setRange(0, 100)
+        self.usage_bar.setValue(0)
+        self.usage_bar.setTextVisible(True)
+        self.usage_bar.setFixedWidth(160)
+
+        usage_layout.addWidget(self.usage_req)
+        usage_layout.addWidget(self.usage_resp)
+        usage_layout.addStretch(1)
+        usage_layout.addWidget(self.usage_ctx)
+        usage_layout.addWidget(self.usage_iter)
+        usage_layout.addWidget(self.usage_bar)
+        root.addWidget(self.usage_panel)
 
         # Лента сообщений
         self.chat_area = QScrollArea()
@@ -517,6 +582,7 @@ class ChatWindow(QWidget):
         self._show_typing()
 
         self._worker = ChatWorker(text, parent=self)
+        self._worker.stats.connect(self._on_stats)
         self._worker.tools.connect(self._on_tools)
         self._worker.reply.connect(self._on_reply)
         self._worker.failure.connect(self._on_failure)
@@ -535,6 +601,50 @@ class ChatWindow(QWidget):
         self._log(f"✗ {message}{self._elapsed_suffix()}")
         self._add_error(message)
         self.status.setText("Ошибка")
+
+    # ---------- расход контекста и токенов ----------
+    def _on_stats(self, usage):
+        if not isinstance(usage, dict) or not usage:
+            return
+        prompt = usage.get("prompt_tokens")
+        comp = usage.get("completion_tokens")
+        total = usage.get("total_tokens")
+        limit = usage.get("context_limit")
+
+        self.usage_req.setText(
+            f"Запрос: {prompt} ток." if prompt is not None else "Запрос: —"
+        )
+        self.usage_resp.setText(
+            f"Ответ: {comp} ток." if comp is not None else "Ответ: —"
+        )
+        calls = usage.get("model_calls")
+        self.usage_iter.setText(
+            f"Итераций: {calls}" if calls is not None else "Итераций: —"
+        )
+        if limit:
+            used = total if isinstance(total, int) else 0
+            pct = min(100, max(0, int(round(used * 100 / limit))))
+            self.usage_ctx.setText(f"Контекст: {used} / {limit} ({pct}%)")
+            self.usage_bar.setValue(pct)
+            color = "#4f6df5"
+            if pct >= 90:
+                color = "#d92d20"
+            elif pct >= 70:
+                color = "#f79009"
+            self.usage_bar.setStyleSheet(
+                "QProgressBar#UsageBar::chunk { background-color: %s; "
+                "border-radius: 7px; }" % color
+            )
+            self.usage_ctx.setToolTip(
+                f"Осталось: {usage.get('context_remaining', '—')} токенов; "
+                f"резерв на ответ: {usage.get('max_output_tokens', '—')}; "
+                f"всего израсходовано за запрос: "
+                f"{usage.get('tokens_consumed', '—')} токенов; "
+                f"вызовов инструментов: {usage.get('tool_calls', '—')}"
+            )
+        else:
+            self.usage_ctx.setText("Контекст: —")
+            self.usage_bar.setValue(0)
 
     # ---------- лог инструментов ----------
     @staticmethod
